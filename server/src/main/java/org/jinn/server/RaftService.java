@@ -78,9 +78,7 @@ public class RaftService extends RaftServiceGrpc.RaftServiceImplBase {
         }
 
         @Override
-        public void onCompleted() {
-            // No action needed for unary RPC
-        }
+        public void onCompleted() { }
     }
 
     private class AppendEntryResponseObserver implements StreamObserver<AppendEntryResponse> {
@@ -111,9 +109,7 @@ public class RaftService extends RaftServiceGrpc.RaftServiceImplBase {
         }
 
         @Override
-        public void onCompleted() {
-            // No action needed for unary RPC
-        }
+        public void onCompleted() { }
     }
 
     @Override

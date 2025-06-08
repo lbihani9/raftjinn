@@ -23,7 +23,7 @@ public class RaftJinnServer {
         this.service = new RaftService(id, nodes);
         this.server = serverBuilder.addService(service)
                 .build();
-        logger.info("Initialized RaftJinnServer with ID: {}, port: {}, cluster size: {}", id, port, nodes.size() + 1);
+        logger.info("Initialized RaftJinnServer with ID: {}, port: {}, cluster size: {}", id, port, nodes.size());
     }
 
     public void start() throws IOException {

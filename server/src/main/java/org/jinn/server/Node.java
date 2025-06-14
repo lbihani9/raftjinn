@@ -11,9 +11,11 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public class Node {
     private static final Logger logger = LogManager.getLogger(Node.class);
-    private static final int MIN_ELECTION_TIME_MS = 150;
-    private static final int MAX_ELECTION_TIME_MS = 300;
+    private static final int MIN_ELECTION_TIME_MS = 200;
+    private static final int MAX_ELECTION_TIME_MS = 600;
     private static final int HEARTBEAT_TIME_MS = 50;
+    private static final int PENDING_FUTURE_CLEANUP_TIME_MS = 60;
+    private static final Random random = new Random();
 
     private final RaftService service;
 
@@ -22,16 +24,16 @@ public class Node {
     private final Set<String> clusterNodes;
 
     // persistent states
-    private volatile AtomicInteger currentTerm;
+    private final AtomicInteger currentTerm;
     private volatile String votedFor;
     private final List<LogEntry> logEntries;
 
     // volatile states
     // index of the highest log entry known to be committed. The majority has acknowledged.
-    private volatile AtomicInteger commitIndex;
+    private final AtomicInteger commitIndex;
 
     // index of the highest log entry applied to the state machine
-    private volatile AtomicInteger lastApplied;
+    private final AtomicInteger lastApplied;
 
     // leader-specific volatile state
     // For each follower, the index of the next log entry to send.
@@ -40,15 +42,18 @@ public class Node {
     // For each follower, the index of the highest log entry known to be replicated.
     private final Map<String, Integer> matchIndex;
 
+    private final ConcurrentSkipListMap<Integer, CompletableFuture<Boolean>> replicationFutures = new ConcurrentSkipListMap<>();
+
     private final Set<String> votersInFavour;
 
     private final ScheduledExecutorService electionTimer = Executors.newSingleThreadScheduledExecutor();
-
     private ScheduledFuture<?> electionTask;
 
     private final ScheduledExecutorService heartbeatTimer = Executors.newSingleThreadScheduledExecutor();
-
     private ScheduledFuture<?> heartbeatTask;
+
+    private final ScheduledExecutorService futureCleanupTimer = Executors.newSingleThreadScheduledExecutor();
+    private ScheduledFuture<?> futureCleanupTask;
 
     Node(String id, Set<String> nodeIds, RaftService service) {
         this.id = id;
@@ -65,16 +70,43 @@ public class Node {
         this.clusterNodes = new HashSet<>(nodeIds);
         clusterNodes.remove(id);
         logger.info("Node {} initialized as FOLLOWER in term {}, cluster size: {}", id, currentTerm, clusterNodes.size() + 1);
-        startElectionTimeout();
+        startElectionTimeout(0);
     }
 
-    private void startElectionTimeout() {
+    private void initializePendingFutureCleanupTimeout() {
+        if (futureCleanupTask == null) {
+            futureCleanupTask = futureCleanupTimer.scheduleWithFixedDelay(
+                this::maybeCommit,
+                0,
+                PENDING_FUTURE_CLEANUP_TIME_MS,
+                TimeUnit.MILLISECONDS
+            );
+        }
+    }
+
+    private void clearPendingFutureCleanupTimeout() {
+        if (futureCleanupTask != null) {
+            futureCleanupTask.cancel(false);
+            futureCleanupTask = null;
+
+            maybeCommit();
+
+            for (Map.Entry<Integer, CompletableFuture<Boolean>> entry : replicationFutures.entrySet()) {
+                if (!entry.getValue().isDone()) {
+                    entry.getValue().complete(false);
+                }
+            }
+            replicationFutures.clear();
+        }
+    }
+
+    private void startElectionTimeout(int startupDelay) {
         cancelElectionTimeout();
-        int randomTimeout = MIN_ELECTION_TIME_MS + new Random().nextInt(MAX_ELECTION_TIME_MS - MIN_ELECTION_TIME_MS + 1);
+        int randomTimeout = MIN_ELECTION_TIME_MS + random.nextInt(MAX_ELECTION_TIME_MS - MIN_ELECTION_TIME_MS + 1);
         logger.debug("Node {} starting election timeout for {} ms", id, randomTimeout);
         electionTask = electionTimer.schedule(
             this::shouldStartElection,
-            randomTimeout,
+            randomTimeout + startupDelay,
             TimeUnit.MILLISECONDS
         );
     }
@@ -92,14 +124,14 @@ public class Node {
 
     private void cancelElectionTimeout() {
         if (electionTask != null) {
-            electionTask.cancel(false);
+            electionTask.cancel(true);
             electionTask = null;
         }
     }
 
     private void cancelHeartbeatTimeout() {
         if (heartbeatTask != null) {
-            heartbeatTask.cancel(false);
+            heartbeatTask.cancel(true);
             heartbeatTask = null;
         }
     }
@@ -116,6 +148,9 @@ public class Node {
         }
 
         for (String nodeId: clusterNodes) {
+            if (Objects.equals(nodeId, id)) {
+                continue;
+            }
             int nxtIndex = nextIndex.get(nodeId);
             int prevLogIndex = nxtIndex - 1;
             int prevLogTerm = (prevLogIndex >= 0 && prevLogIndex < logEntries.size())
@@ -135,16 +170,13 @@ public class Node {
                     .addAllEntries(deltaLogEntries)
                     .build();
 
-            logger.info("Node {} sending logs to Node {}", id, nodeId);
+//            logger.info("Node {} sending logs to Node {}", id, nodeId);
             service.sendAppendEntryRequest(nodeId, appendEntry);
         }
     }
 
+    // managed by non-leaders
     private void startElection() {
-        if (state == State.LEADER) {
-            cancelHeartbeatTimeout();
-        }
-
         votersInFavour.clear();
         state = State.CANDIDATE;
         currentTerm.addAndGet(1);
@@ -152,7 +184,6 @@ public class Node {
         votersInFavour.add(id);
 
         logger.info("Node {} starting election for term {}", id, currentTerm);
-        startElectionTimeout();
 
         int lastLogIndex = logEntries.size() - 1;
         int lastLogTerm = lastLogIndex >= 0 ? logEntries.get(lastLogIndex).getTerm() : 0;
@@ -163,15 +194,20 @@ public class Node {
                 .setLastLogTerm(lastLogTerm)
                 .build();
 
-        for (String nodeId: clusterNodes) {
-            logger.debug("Node {} sending vote request to {} for term {}", id, nodeId, currentTerm);
-            service.sendVoteRequest(nodeId, voteRequest);
+        for (String peer : clusterNodes) {
+            if (!peer.equals(id)) {
+                logger.debug("Node {} sending vote request to {} for term {}", id, peer, currentTerm);
+                service.sendVoteRequest(peer, voteRequest);
+            }
         }
+
+        startElectionTimeout(0);
     }
 
+    // Managed by all nodes
     VoteResponse handleVoteRequest(VoteRequest request) {
         logger.debug("Node {} received vote request from {} for term {}", id, request.getCandidateId(), request.getTerm());
-        
+
         if (request.getTerm() < currentTerm.intValue()) {
             logger.debug("Node {} rejected vote request from {} (stale term: {})", id, request.getCandidateId(), request.getTerm());
             return VoteResponse.newBuilder()
@@ -183,11 +219,8 @@ public class Node {
 
         if (request.getTerm() > currentTerm.intValue()) {
             logger.info("Node {} updating term {} -> {} from vote request", id, currentTerm, request.getTerm());
-            votedFor = null;
-            currentTerm.set(request.getTerm());
-            state = State.FOLLOWER;
-            votersInFavour.clear();
-            startElectionTimeout();
+            demote(State.FOLLOWER, request.getTerm());
+            startElectionTimeout(0);
         }
 
         boolean canVote = (votedFor == null || votedFor.equals(request.getCandidateId()));
@@ -200,12 +233,12 @@ public class Node {
         boolean isCandidateUptoDate = (candidateLastLogTerm > lastLogTerm) || (candidateLastLogIndex >= lastLogIndex && candidateLastLogTerm == lastLogTerm);
 
         if (canVote && isCandidateUptoDate) {
-            votedFor = request.getCandidateId();
             logger.info("Node {} voting for {} in term {}", id, request.getCandidateId(), currentTerm);
-            startElectionTimeout();
+            votedFor = request.getCandidateId();
+            startElectionTimeout(0);
             return VoteResponse.newBuilder()
                     .setVoterId(id)
-                    .setTerm(currentTerm.intValue())
+                    .setTerm(request.getTerm())
                     .setHasVoted(true)
                     .build();
         }
@@ -213,11 +246,12 @@ public class Node {
         logger.debug("Node {} rejected vote request from {} (up-to-date check failed)", id, request.getCandidateId());
         return VoteResponse.newBuilder()
                 .setVoterId(id)
-                .setTerm(currentTerm.intValue())
+                .setTerm(request.getTerm())
                 .setHasVoted(false)
                 .build();
     }
 
+    // Managed by candidates
     public void handleVoteResponse(VoteResponse response) {
         logger.debug("Node {} received vote response from {}, granted: {}, term: {}", 
                     id, response.getVoterId(), response.getHasVoted(), response.getTerm());
@@ -229,22 +263,18 @@ public class Node {
         if (response.getTerm() > currentTerm.intValue()) {
             logger.info("Node {} stepping down: received higher term {} from {}", 
                        id, response.getTerm(), response.getVoterId());
-            currentTerm.set(response.getTerm());
-            votedFor = null;
-            state = State.FOLLOWER;
-            votersInFavour.clear();
-            startElectionTimeout();
+            demote(State.FOLLOWER, response.getTerm());
+            startElectionTimeout(0);
             return;
         }
 
         if (response.getHasVoted()) {
             votersInFavour.add(response.getVoterId());
-            logger.debug("Node {} received vote from {}, total votes: {}", 
-                        id, response.getVoterId(), votersInFavour.size());
-        }
+            if (hasMajorityVotes()) {
+                promoteLeader();
+            }
 
-        if (hasMajorityVotes()) {
-            promoteLeader();
+            logger.debug("Node {} received vote from {}, total votes: {}", id, response.getVoterId(), votersInFavour.size());
         }
     }
 
@@ -257,21 +287,36 @@ public class Node {
         state = State.LEADER;
         cancelElectionTimeout();
 
-        // Initialize leader state
         for (String nodeId: clusterNodes) {
             nextIndex.put(nodeId, logEntries.size());
             matchIndex.put(nodeId, -1);
         }
 
+        initializePendingFutureCleanupTimeout();
         startHeartbeats();
     }
 
+    private void demote(State to, int term) {
+        if (state == State.LEADER) {
+            cancelHeartbeatTimeout();
+            clearPendingFutureCleanupTimeout();
+        }
+
+        state = to;
+        currentTerm.set(term);
+        votersInFavour.clear();
+        votedFor = null;
+    }
+
+    // Managed by non-leaders
     AppendEntryResponse handleAppendEntryRequest(AppendEntryRequest request) {
         logger.debug("Node {} received append entry request from {} for term {}", 
                     id, request.getLeaderId(), request.getTerm());
         
         int prevLogIndex = request.getPrevLogIndex();
         int prevLogTerm = request.getPrevLogTerm();
+
+        startElectionTimeout(0);
 
         if (request.getTerm() < currentTerm.intValue()) {
             return AppendEntryResponse.newBuilder()
@@ -284,19 +329,23 @@ public class Node {
         }
 
         if (request.getTerm() > currentTerm.intValue()) {
-            votedFor = null;
-            state = State.FOLLOWER;
-            currentTerm.set(request.getTerm());
-            votersInFavour.clear();
-            startElectionTimeout();
+            demote(State.FOLLOWER, request.getTerm());
         }
-
-        startElectionTimeout();
 
         if (prevLogIndex >= 0) {
             // Since prevLogIndex is the last index sent to this follower, then ideally if this same
             // index is sent again for replication, we should reject the request.
-            if (!(prevLogIndex < logEntries.size() && logEntries.get(prevLogIndex).getTerm() == prevLogTerm)) {
+            if (prevLogIndex >= logEntries.size()) {
+                return AppendEntryResponse.newBuilder()
+                        .setFollowerId(id)
+                        .setTerm(currentTerm.intValue())
+                        .setPrevLogTerm(prevLogTerm)
+                        .setMatchIndex(prevLogIndex)
+                        .setIsReplicated(false)
+                        .build();
+            }
+
+            if (logEntries.get(prevLogIndex).getTerm() != prevLogTerm) {
                 return AppendEntryResponse.newBuilder()
                         .setFollowerId(id)
                         .setTerm(currentTerm.intValue())
@@ -331,7 +380,7 @@ public class Node {
         }
 
         // Acknowledging the largest index commited.
-        int matchIndex = request.getEntriesCount() - 1;
+        int matchIndex = logInsertIndex + request.getEntriesCount() - 1;
         return AppendEntryResponse.newBuilder()
                 .setFollowerId(id)
                 .setTerm(currentTerm.intValue())
@@ -341,6 +390,7 @@ public class Node {
                 .build();
     }
 
+    // Managed by leader.
     public void handleAppendEntryResponse(AppendEntryResponse response) {
         if (state != State.LEADER) {
             return;
@@ -352,12 +402,8 @@ public class Node {
         }
 
         if (response.getTerm() > currentTerm.intValue()) {
-            currentTerm.set(response.getTerm());
-            votedFor = null;
-            state = State.FOLLOWER;
-            votersInFavour.clear();
-            cancelHeartbeatTimeout();
-            startElectionTimeout();
+            demote(State.FOLLOWER, response.getTerm());
+            startElectionTimeout(0);
             return;
         }
 
@@ -402,9 +448,9 @@ public class Node {
     }
 
     // for client requests
-    public boolean addLogEntry(Object command) {
+    public CompletableFuture<Boolean> addLogEntry(Object command) {
         if (state != State.LEADER) {
-            return false;
+            return CompletableFuture.completedFuture(false);
         }
 
         LogEntry entry = LogEntry.newBuilder()
@@ -414,7 +460,24 @@ public class Node {
                 .build();
 
         logEntries.add(entry);
-        return true;
+        return waitForReplication(entry.getIndex());
+    }
+
+    private CompletableFuture<Boolean> waitForReplication(int index) {
+        CompletableFuture<Boolean> future = new CompletableFuture<>();
+        replicationFutures.put(index, future);
+        return future;
+    }
+
+    private void maybeCommit() {
+        int newCommitIndex = commitIndex.intValue();
+        NavigableMap<Integer, CompletableFuture<Boolean>> readyFutures = replicationFutures.headMap(newCommitIndex, true);
+        for (Map.Entry<Integer, CompletableFuture<Boolean>> entry : readyFutures.entrySet()) {
+            if (!entry.getValue().isDone()) {
+                entry.getValue().complete(true);
+            }
+        }
+        readyFutures.clear();
     }
 
     public State getState() {

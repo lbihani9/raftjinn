@@ -68,8 +68,7 @@ public class Node {
         this.nextIndex = new HashMap<>();
         this.matchIndex = new HashMap<>();
         this.clusterNodes = new HashSet<>(nodeIds);
-        clusterNodes.remove(id);
-        logger.info("Node {} initialized as FOLLOWER in term {}, cluster size: {}", id, currentTerm, clusterNodes.size() + 1);
+        logger.info("Node {} initialized as FOLLOWER in term {}, cluster size: {}", id, currentTerm, clusterNodes.size());
         startElectionTimeout(0);
     }
 
@@ -103,7 +102,7 @@ public class Node {
     private void startElectionTimeout(int startupDelay) {
         cancelElectionTimeout();
         int randomTimeout = MIN_ELECTION_TIME_MS + random.nextInt(MAX_ELECTION_TIME_MS - MIN_ELECTION_TIME_MS + 1);
-        logger.debug("Node {} starting election timeout for {} ms", id, randomTimeout);
+        logger.trace("Node {} starting election timeout for {} ms", id, randomTimeout);
         electionTask = electionTimer.schedule(
             this::shouldStartElection,
             randomTimeout + startupDelay,
@@ -136,13 +135,13 @@ public class Node {
         }
     }
 
-    private void shouldStartElection() {
+    synchronized private void shouldStartElection() {
         if (state != State.LEADER) {
             startElection();
         }
     }
 
-    private void sendHeartBeats() {
+    synchronized private void sendHeartBeats() {
         if (state != State.LEADER) {
             return;
         }
@@ -170,13 +169,13 @@ public class Node {
                     .addAllEntries(deltaLogEntries)
                     .build();
 
-//            logger.info("Node {} sending logs to Node {}", id, nodeId);
+//            logger.trace("Node {} sending logs to Node {}", id, nodeId);
             service.sendAppendEntryRequest(nodeId, appendEntry);
         }
     }
 
     // managed by non-leaders
-    private void startElection() {
+    synchronized private void startElection() {
         votersInFavour.clear();
         state = State.CANDIDATE;
         currentTerm.addAndGet(1);
@@ -205,7 +204,7 @@ public class Node {
     }
 
     // Managed by all nodes
-    VoteResponse handleVoteRequest(VoteRequest request) {
+    synchronized VoteResponse handleVoteRequest(VoteRequest request) {
         logger.debug("Node {} received vote request from {} for term {}", id, request.getCandidateId(), request.getTerm());
 
         if (request.getTerm() < currentTerm.intValue()) {
@@ -252,8 +251,8 @@ public class Node {
     }
 
     // Managed by candidates
-    public void handleVoteResponse(VoteResponse response) {
-        logger.debug("Node {} received vote response from {}, granted: {}, term: {}", 
+    synchronized public void handleVoteResponse(VoteResponse response) {
+        logger.debug("Node {} received vote response from {}, granted: {}, term: {}",
                     id, response.getVoterId(), response.getHasVoted(), response.getTerm());
 
         if (state != State.CANDIDATE || response.getTerm() < currentTerm.intValue()) {
@@ -270,19 +269,20 @@ public class Node {
 
         if (response.getHasVoted()) {
             votersInFavour.add(response.getVoterId());
+            logger.debug("Node {} received vote from {}, total votes: {}", id, response.getVoterId(), votersInFavour.size());
+            logger.trace("Current voters: {}", votersInFavour);
             if (hasMajorityVotes()) {
                 promoteLeader();
             }
-
-            logger.debug("Node {} received vote from {}, total votes: {}", id, response.getVoterId(), votersInFavour.size());
         }
     }
 
-    private boolean hasMajorityVotes() {
-        return votersInFavour.size() >= (clusterNodes.size() + 1) / 2;
+    synchronized private boolean hasMajorityVotes() {
+        logger.debug("Quorum check: voters={}, clusterNodes={}", votersInFavour, clusterNodes);
+        return votersInFavour.size() >= clusterNodes.size()/2 + 1;
     }
 
-    private void promoteLeader() {
+    synchronized private void promoteLeader() {
         logger.info("Node {} becoming leader for term {}", id, currentTerm);
         state = State.LEADER;
         cancelElectionTimeout();
@@ -296,7 +296,7 @@ public class Node {
         startHeartbeats();
     }
 
-    private void demote(State to, int term) {
+    synchronized private void demote(State to, int term) {
         if (state == State.LEADER) {
             cancelHeartbeatTimeout();
             clearPendingFutureCleanupTimeout();
@@ -309,8 +309,8 @@ public class Node {
     }
 
     // Managed by non-leaders
-    AppendEntryResponse handleAppendEntryRequest(AppendEntryRequest request) {
-        logger.debug("Node {} received append entry request from {} for term {}", 
+    synchronized AppendEntryResponse handleAppendEntryRequest(AppendEntryRequest request) {
+        logger.trace("Node {} received append entry request from {} for term {}",
                     id, request.getLeaderId(), request.getTerm());
         
         int prevLogIndex = request.getPrevLogIndex();
@@ -391,7 +391,7 @@ public class Node {
     }
 
     // Managed by leader.
-    public void handleAppendEntryResponse(AppendEntryResponse response) {
+    synchronized public void handleAppendEntryResponse(AppendEntryResponse response) {
         if (state != State.LEADER) {
             return;
         }
@@ -417,7 +417,7 @@ public class Node {
         }
     }
 
-    private void updateCommitIndex() {
+    synchronized private void updateCommitIndex() {
         // Find the highest index replicated on a majority of servers
         for (int index = logEntries.size() - 1; index > commitIndex.intValue(); index--) {
             if (logEntries.get(index).getTerm() == currentTerm.intValue()) { // Only commit entries from current term
@@ -437,18 +437,18 @@ public class Node {
         }
     }
 
-    private void applyCommittedEntries() {
+    synchronized private void applyCommittedEntries() {
         while (lastApplied.intValue() < commitIndex.intValue()) {
             lastApplied.addAndGet(1);
             if (lastApplied.intValue() < logEntries.size()) {
                 LogEntry entry = logEntries.get(lastApplied.intValue());
-                logger.info("Applied entry ({}): {}", id, entry);
+                logger.debug("Applied entry ({}): {}", id, entry);
             }
         }
     }
 
     // for client requests
-    public CompletableFuture<Boolean> addLogEntry(Object command) {
+    synchronized public CompletableFuture<Boolean> addLogEntry(Object command) {
         if (state != State.LEADER) {
             return CompletableFuture.completedFuture(false);
         }
@@ -463,13 +463,13 @@ public class Node {
         return waitForReplication(entry.getIndex());
     }
 
-    private CompletableFuture<Boolean> waitForReplication(int index) {
+    synchronized private CompletableFuture<Boolean> waitForReplication(int index) {
         CompletableFuture<Boolean> future = new CompletableFuture<>();
         replicationFutures.put(index, future);
         return future;
     }
 
-    private void maybeCommit() {
+    synchronized private void maybeCommit() {
         int newCommitIndex = commitIndex.intValue();
         NavigableMap<Integer, CompletableFuture<Boolean>> readyFutures = replicationFutures.headMap(newCommitIndex, true);
         for (Map.Entry<Integer, CompletableFuture<Boolean>> entry : readyFutures.entrySet()) {

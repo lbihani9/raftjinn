@@ -33,7 +33,7 @@ public class RaftService extends RaftServiceGrpc.RaftServiceImplBase {
     public void sendVoteRequest(String nodeId, VoteRequest request) {
         RaftServiceGrpc.RaftServiceStub stub = stubs.get(nodeId);
         if (stub != null) {
-            logger.debug("[{}] Sending VoteRequest to {}, term={}", node.getId(), nodeId, request.getTerm());
+            logger.trace("[{}] Sending VoteRequest to {}, term={}", node.getId(), nodeId, request.getTerm());
             stub.requestVote(request, new VoteResponseObserver(nodeId));
         } else {
             logger.warn("[{}] No stub found for node {}", node.getId(), nodeId);
@@ -43,7 +43,7 @@ public class RaftService extends RaftServiceGrpc.RaftServiceImplBase {
     public void sendAppendEntryRequest(String nodeId, AppendEntryRequest request) {
         RaftServiceGrpc.RaftServiceStub stub = stubs.get(nodeId);
         if (stub != null) {
-            logger.debug("[{}] Sending AppendEntryRequest to {}, term={}, entries={}", node.getId(), nodeId, request.getTerm(), request.getEntriesCount());
+            logger.trace("[{}] Sending AppendEntryRequest to {}, term={}, entries={}", node.getId(), nodeId, request.getTerm(), request.getEntriesCount());
             stub.appendEntries(request, new AppendEntryResponseObserver(nodeId));
         } else {
             logger.warn("[{}] No stub found for node {}", node.getId(), nodeId);
@@ -59,7 +59,7 @@ public class RaftService extends RaftServiceGrpc.RaftServiceImplBase {
 
         @Override
         public void onNext(VoteResponse response) {
-            logger.debug("[{}] Received VoteResponse from {}, hasVoted={}, term={}", node.getId(), response.getVoterId(), response.getHasVoted(), response.getTerm());
+            logger.trace("[{}] Received VoteResponse from {}, hasVoted={}, term={}", node.getId(), response.getVoterId(), response.getHasVoted(), response.getTerm());
             synchronized (node) {
                 node.handleVoteResponse(response);
             }
@@ -90,7 +90,7 @@ public class RaftService extends RaftServiceGrpc.RaftServiceImplBase {
 
         @Override
         public void onNext(AppendEntryResponse response) {
-            logger.debug("[{}] Received AppendEntryResponse from {}, isReplicated={}, term={}", node.getId(), response.getFollowerId(), response.getIsReplicated(), response.getTerm());
+            logger.trace("[{}] Received AppendEntryResponse from {}, isReplicated={}, term={}", node.getId(), response.getFollowerId(), response.getIsReplicated(), response.getTerm());
             synchronized (node) {
                 node.handleAppendEntryResponse(response);
             }

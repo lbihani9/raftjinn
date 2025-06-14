@@ -51,7 +51,7 @@ public class RaftJinnServer {
 
     public void blockUntilShutdown() throws InterruptedException {
         if (server != null) {
-            logger.debug("Waiting for server termination");
+            logger.trace("Waiting for server termination");
             server.awaitTermination();
         }
     }

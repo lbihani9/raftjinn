@@ -3,5 +3,6 @@ package org.jinn.server;
 public enum State {
     LEADER,
     FOLLOWER,
-    CANDIDATE
+    CANDIDATE,
+    CATCHING_UP
 }

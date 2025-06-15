@@ -6,6 +6,53 @@ option java_outer_classname = "RaftProto";
 service RaftService {
     rpc RequestVote (VoteRequest) returns (VoteResponse);
     rpc AppendEntries (AppendEntryRequest) returns (AppendEntryResponse);
+
+    rpc ClientWrite (ClientWriteRequest) returns (ClientWriteResponse);
+    rpc ClientRead (ClientReadRequest) returns (ClientReadResponse);
+
+    rpc Ping (PingRequest) returns (PingResponse);
+}
+
+message PingRequest {
+    string client_id = 1;
+    int64 timestamp = 2;
+}
+
+message PingResponse {
+    string node_id = 1;
+    string state = 2;  // "FOLLOWER", "LEADER", "CANDIDATE"
+    int32 current_term = 3;
+    int32 commit_index = 4;
+    int64 response_timestamp = 5;
+    string cluster_info = 6;  // Basic cluster information
+}
+
+message ClientWriteRequest {
+    string key = 1;
+    string value = 2;
+    string client_id = 3;
+    int64 request_id = 4;
+}
+
+message ClientWriteResponse {
+    bool success = 1;
+    string leader_hint = 2;  // If not leader, redirect to this node
+    string error_message = 3;
+    int64 request_id = 4;
+}
+
+message ClientReadRequest {
+    string key = 1;
+    string client_id = 2;
+    int64 request_id = 3;
+}
+
+message ClientReadResponse {
+    bool success = 1;
+    string value = 2;
+    string leader_hint = 3;  // If not leader, redirect to this node
+    string error_message = 4;
+    int64 request_id = 5;
 }
 
 message VoteRequest {

@@ -3,6 +3,10 @@ package org.jinn.server;
 import io.grpc.*;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.jinn.configs.ClusterConfig;
+import org.jinn.configs.ConfigLoader;
+import org.jinn.configs.NodeAddress;
+import org.jinn.configs.RaftJinnConfig;
 
 import java.io.IOException;
 import java.util.Map;
@@ -14,16 +18,22 @@ public class RaftJinnServer {
     private final Server server;
     private final RaftService service;
 
-    public RaftJinnServer(String id, int port, Map<String, String> nodes) throws IOException {
-        this(Grpc.newServerBuilderForPort(port, InsecureServerCredentials.create()), id, port, nodes);
-    }
+    public RaftJinnServer(String configPath) {
+        ConfigLoader loader = new ConfigLoader(configPath);
+        RaftJinnConfig raftJinnConfig = loader.load();
 
-    public RaftJinnServer(ServerBuilder<?> serverBuilder, String id, int port, Map<String, String> nodes) {
-        this.port = port;
-        this.service = new RaftService(id, nodes);
+        ClusterConfig clusterConfig = raftJinnConfig.getClusterConfig();
+        String nodeId = clusterConfig.getNodeId();
+        NodeAddress nodeAddress = clusterConfig.getMembers().get(nodeId);
+
+        this.port = nodeAddress.getPort();
+
+        ServerBuilder<?> serverBuilder = Grpc.newServerBuilderForPort(port, InsecureServerCredentials.create());
+        this.service = new RaftService(raftJinnConfig);
         this.server = serverBuilder.addService(service)
                 .build();
-        logger.info("Initialized RaftJinnServer with ID: {}, port: {}, cluster size: {}", id, port, nodes.size());
+
+        logger.info("Initialized RaftJinnServer with ID: {}, port: {}, cluster size: {}", nodeId, port, clusterConfig.getMembers().size());
     }
 
     public void start() throws IOException {

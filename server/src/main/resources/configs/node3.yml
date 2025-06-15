@@ -1,0 +1,22 @@
+storeConfig:
+  maxWalSizeBytes: 10485760
+  walDir: "./wal/node-3"
+
+clusterConfig:
+  nodeId: node-3
+  startupMode: FOLLOWER
+  members:
+    node-1:
+      host: localhost
+      port: 9000
+    node-2:
+      host: localhost
+      port: 9001
+    node-3:
+      host: localhost
+      port: 9002
+
+nodeConfig:
+  maxLogBytes: 3000000
+  logFlushIntervalMs: 3000
+

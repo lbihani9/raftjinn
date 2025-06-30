@@ -1,9 +1,9 @@
 storeConfig:
   maxWalSizeBytes: 10485760
-  walDir: "./wal/node-2"
+  walDir: "./wal/node-4"
 
 clusterConfig:
-  nodeId: node-2
+  nodeId: node-4
   startupMode: FOLLOWER
   members:
     node-1:

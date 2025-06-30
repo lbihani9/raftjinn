@@ -15,6 +15,9 @@ clusterConfig:
     node-3:
       host: localhost
       port: 9002
+    node-4:
+      host: localhost
+      port: 9003
 
 nodeConfig:
   maxLogBytes: 3000000

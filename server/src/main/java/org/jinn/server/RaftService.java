@@ -61,7 +61,7 @@ public class RaftService extends RaftServiceGrpc.RaftServiceImplBase {
         RaftServiceGrpc.RaftServiceStub stub = stubs.get(nodeId);
         if (stub != null) {
             logger.trace("[{}] Sending VoteRequest to {}, term={}", node.getId(), nodeId, request.getTerm());
-            stub.requestVote(request, new VoteResponseObserver(nodeId));
+            stub.requestVote(request, new VoteResponseObserver(nodeId, request.getTerm()));
         } else {
             logger.warn("[{}] No stub found for node {}", node.getId(), nodeId);
         }
@@ -79,16 +79,18 @@ public class RaftService extends RaftServiceGrpc.RaftServiceImplBase {
 
     private class VoteResponseObserver implements StreamObserver<VoteResponse> {
         private final String targetNodeId;
+        private final int sentTerm;
 
-        VoteResponseObserver(String targetNodeId) {
+        VoteResponseObserver(String targetNodeId, int sentTerm) {
             this.targetNodeId = targetNodeId;
+            this.sentTerm = sentTerm;
         }
 
         @Override
         public void onNext(VoteResponse response) {
             logger.trace("[{}] Received VoteResponse from {}, hasVoted={}, term={}", node.getId(), response.getVoterId(), response.getHasVoted(), response.getTerm());
             synchronized (node) {
-                node.handleVoteResponse(response);
+                node.handleVoteResponse(response, sentTerm);
             }
         }
 

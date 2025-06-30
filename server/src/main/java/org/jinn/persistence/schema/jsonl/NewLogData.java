@@ -6,7 +6,7 @@ import org.jinn.raft.proto.LogEntry;
 public class NewLogData {
     private int index;
     private int term;
-    private ByteString command;
+    private String command;
 
     // Default constructor for Jackson
     public NewLogData() {}
@@ -14,7 +14,7 @@ public class NewLogData {
     public NewLogData(LogEntry entry) {
         this.index = entry.getIndex();
         this.term = entry.getTerm();
-        this.command = entry.getCommand();
+        this.command = entry.getCommand().toStringUtf8();
     }
 
     public int getIndex() {
@@ -33,11 +33,11 @@ public class NewLogData {
         this.term = term;
     }
 
-    public ByteString getCommand() {
+    public String getCommand() {
         return command;
     }
 
-    public void setCommand(ByteString command) {
+    public void setCommand(String command) {
         this.command = command;
     }
 }

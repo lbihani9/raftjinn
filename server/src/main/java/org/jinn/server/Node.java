@@ -1,11 +1,9 @@
 package org.jinn.server;
 
-import com.google.protobuf.ByteString;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.jinn.configs.ClusterConfig;
 import org.jinn.configs.Mode;
-import org.jinn.configs.NodeConfig;
 import org.jinn.configs.RaftJinnConfig;
 import org.jinn.persistence.JinnPersistentState;
 import org.jinn.persistence.store.JinnStore;
@@ -81,15 +79,9 @@ public class Node {
         this.clusterNodes = new HashSet<>(clusterConfig.getMembers().keySet());
         this.store = new JsonlStore(config.getStoreConfig());
         this.logManager = new RaftLogManager(store, config.getNodeConfig());
-        this.state = startupMode == Mode.RECOVERY ? State.CATCHING_UP : State.FOLLOWER;
+        this.state = State.CATCHING_UP;
 
-        if (startupMode == Mode.RECOVERY) {
-            loadPersistentState();
-        } else {
-            logger.info("Node {} initialized as FOLLOWER in term {}, cluster size: {}", 
-                       id, currentTerm, clusterNodes.size());
-            startElectionTimeout(0);
-        }
+        loadPersistentState();
     }
 
     private void loadPersistentState() {
@@ -100,12 +92,13 @@ public class Node {
             this.commitIndex.set(persistentState.getCommitIndex());
             
             // Load log entries into LogManager
-            for (LogEntry entry : persistentState.getEntries()) {
-                logManager.appendEntries(Arrays.asList(entry));
-            }
-            
-            logger.info("Node {} loaded persistent state: term={}, votedFor={}, commitIndex={}, logEntries={}", 
+            logManager.appendEntries(new ArrayList<>(persistentState.getEntries()));
+
+            logger.info("Node {} loaded persistent state: term={}, votedFor={}, commitIndex={}, logEntries={}",
                        id, currentTerm.get(), votedFor, commitIndex.get(), logManager.size());
+
+            this.state = State.FOLLOWER;
+            startElectionTimeout();
         } catch (Exception e) {
             logger.warn("Failed to load persistent state for node {}, starting fresh: {}", id, e.getMessage());
             throw new RuntimeException(e);
@@ -139,13 +132,16 @@ public class Node {
         }
     }
 
-    private void startElectionTimeout(int startupDelay) {
+    private void startElectionTimeout() {
         cancelElectionTimeout();
+
         int randomTimeout = MIN_ELECTION_TIME_MS + random.nextInt(MAX_ELECTION_TIME_MS - MIN_ELECTION_TIME_MS + 1);
         logger.trace("Node {} starting election timeout for {} ms", id, randomTimeout);
+
+        int termStarted = currentTerm.intValue();
         electionTask = electionTimer.schedule(
-            this::shouldStartElection,
-            randomTimeout + startupDelay,
+            () -> shouldStartElection(termStarted),
+            randomTimeout,
             TimeUnit.MILLISECONDS
         );
     }
@@ -175,51 +171,29 @@ public class Node {
         }
     }
 
-    synchronized private void shouldStartElection() {
-        if (state != State.LEADER) {
-            startElection();
-        }
-    }
-
-    synchronized private void sendHeartBeats() {
-        if (state != State.LEADER) {
+    synchronized private void shouldStartElection(int termStarted) {
+        cancelElectionTimeout();
+        if (state != State.FOLLOWER && state != State.CANDIDATE) {
             return;
         }
 
-        for (String nodeId: clusterNodes) {
-            if (Objects.equals(nodeId, id)) {
-                continue;
-            }
-            Integer nxtIndex = nextIndex.get(nodeId);
-            if (nxtIndex == null) {
-                logger.warn("Node {} has no nextIndex for follower {}, skipping", id, nodeId);
-                continue;
-            }
-            int prevLogIndex = nxtIndex - 1;
-            int prevLogTerm = logManager.getTermAt(prevLogIndex);
-
-            List<LogEntry> deltaLogEntries = logManager.getEntriesFrom(nxtIndex);
-
-            AppendEntryRequest appendEntry = AppendEntryRequest.newBuilder()
-                    .setTerm(currentTerm.intValue())
-                    .setLeaderCommit(commitIndex.intValue())
-                    .setPrevLogTerm(prevLogTerm)
-                    .setPrevLogIndex(prevLogIndex)
-                    .addAllEntries(deltaLogEntries)
-                    .build();
-
-            service.sendAppendEntryRequest(nodeId, appendEntry);
+        if (termStarted != currentTerm.intValue()) {
+            startElectionTimeout();
+            return;
         }
+
+        startElection();
     }
 
     synchronized private void startElection() {
         votersInFavour.clear();
         state = State.CANDIDATE;
         currentTerm.addAndGet(1);
-        store.persistTerm(currentTerm.intValue());
+        int savedCurrentTerm = currentTerm.intValue();
         votedFor = id;
-        store.persistVotedFor(id, currentTerm.intValue());
         votersInFavour.add(id);
+        store.persistTerm(savedCurrentTerm);
+        store.persistVotedFor(id, savedCurrentTerm);
 
         logger.info("Node {} starting election for term {}", id, currentTerm);
 
@@ -228,7 +202,7 @@ public class Node {
         
         VoteRequest voteRequest = VoteRequest.newBuilder()
                 .setCandidateId(id)
-                .setTerm(currentTerm.intValue())
+                .setTerm(savedCurrentTerm)
                 .setLastLogIndex(lastLogIndex)
                 .setLastLogTerm(lastLogTerm)
                 .build();
@@ -240,11 +214,16 @@ public class Node {
             }
         }
 
-        startElectionTimeout(0);
+        startElectionTimeout();
     }
 
     synchronized VoteResponse handleVoteRequest(VoteRequest request) {
         logger.debug("Node {} received vote request from {} for term {}", id, request.getCandidateId(), request.getTerm());
+
+        if (request.getTerm() > currentTerm.intValue()) {
+            logger.info("Node {} updating term {} -> {} from vote request", id, currentTerm, request.getTerm());
+            demote(State.FOLLOWER, request.getTerm());
+        }
 
         if (request.getTerm() < currentTerm.intValue()) {
             logger.debug("Node {} rejected vote request from {} (stale term: {})", id, request.getCandidateId(), request.getTerm());
@@ -253,13 +232,6 @@ public class Node {
                     .setTerm(currentTerm.intValue())
                     .setHasVoted(false)
                     .build();
-        }
-
-        if (request.getTerm() > currentTerm.intValue()) {
-            logger.info("Node {} updating term {} -> {} from vote request", id, currentTerm, request.getTerm());
-            demote(State.FOLLOWER, request.getTerm());
-            store.persistTerm(request.getTerm());
-            startElectionTimeout(0);
         }
 
         boolean canVote = (votedFor == null || votedFor.equals(request.getCandidateId()));
@@ -275,7 +247,7 @@ public class Node {
             logger.info("Node {} voting for {} in term {}", id, request.getCandidateId(), currentTerm);
             votedFor = request.getCandidateId();
             store.persistVotedFor(request.getCandidateId(), request.getTerm());
-            startElectionTimeout(0);
+            startElectionTimeout();
             return VoteResponse.newBuilder()
                     .setVoterId(id)
                     .setTerm(request.getTerm())
@@ -291,13 +263,43 @@ public class Node {
                 .build();
     }
 
+    // Managed by candidates
+    synchronized public void handleVoteResponse(VoteResponse response, int sentTerm) {
+        logger.debug("Node {} received vote response from {}, granted: {}, term: {}",
+                id, response.getVoterId(), response.getHasVoted(), response.getTerm());
+
+        if (state != State.CANDIDATE) {
+            return;
+        }
+
+        // Delayed response of an old election. Should be ignored.
+        if (response.getTerm() < currentTerm.intValue()) {
+            return;
+        }
+
+        if (response.getTerm() > currentTerm.intValue()) {
+            logger.info("Node {} stepping down: received higher term {} from {}", id, response.getTerm(), response.getVoterId());
+            demote(State.FOLLOWER, response.getTerm());
+            return;
+        }
+
+        if (response.getHasVoted()) {
+            votersInFavour.add(response.getVoterId());
+            logger.debug("Node {} received vote from {}, total votes: {}", id, response.getVoterId(), votersInFavour.size());
+            logger.trace("Current voters: {}", votersInFavour);
+            if (hasMajorityVotes()) {
+                promoteLeader();
+            }
+        }
+    }
+
     synchronized private void promoteLeader() {
+        cancelElectionTimeout();
         logger.info("Node {} becoming leader for term {}", id, currentTerm);
         state = State.LEADER;
-        cancelElectionTimeout();
 
         for (String nodeId: clusterNodes) {
-            nextIndex.put(nodeId, logManager.getNextIndex());
+            nextIndex.put(nodeId, logManager.getLastIndex() + 1);
             matchIndex.put(nodeId, -1);
         }
 
@@ -312,11 +314,47 @@ public class Node {
         }
 
         state = to;
-        store.persistTerm(term);
-        currentTerm.set(term);
-        store.persistVotedFor(null, term);
         votersInFavour.clear();
         votedFor = null;
+        currentTerm.set(term);
+        store.persistTerm(term);
+        store.persistVotedFor(null, term);
+        if (to == State.FOLLOWER) {
+            startElectionTimeout();
+        }
+    }
+
+    synchronized private void sendHeartBeats() {
+        if (state != State.LEADER) {
+            return;
+        }
+
+        int savedCurrentTerm = currentTerm.intValue();
+        for (String nodeId: clusterNodes) {
+            if (Objects.equals(nodeId, id)) {
+                continue;
+            }
+            Integer idx = nextIndex.get(nodeId);
+            if (idx == null) {
+                logger.warn("Node {} has no nextIndex entry for follower {}, skipping", id, nodeId);
+                continue;
+            }
+            int prevLogIndex = idx - 1;
+            int prevLogTerm = logManager.getTermAt(prevLogIndex);
+
+            List<LogEntry> deltaLogEntries = logManager.getEntriesFrom(idx);
+
+            // TODO: Leader id can also be passed from here. We don't have to broadcast discovery messages when a client sends request to follower.
+            AppendEntryRequest appendEntry = AppendEntryRequest.newBuilder()
+                    .setTerm(savedCurrentTerm)
+                    .setLeaderCommit(commitIndex.intValue())
+                    .setPrevLogTerm(prevLogTerm)
+                    .setPrevLogIndex(prevLogIndex)
+                    .addAllEntries(deltaLogEntries)
+                    .build();
+
+            service.sendAppendEntryRequest(nodeId, appendEntry);
+        }
     }
 
     synchronized AppendEntryResponse handleAppendEntryRequest(AppendEntryRequest request) {
@@ -326,7 +364,11 @@ public class Node {
         int prevLogIndex = request.getPrevLogIndex();
         int prevLogTerm = request.getPrevLogTerm();
 
-        startElectionTimeout(0);
+        if (request.getTerm() > currentTerm.intValue()) {
+            demote(State.FOLLOWER, request.getTerm());
+        }
+
+        startElectionTimeout();
 
         if (request.getTerm() < currentTerm.intValue()) {
             return AppendEntryResponse.newBuilder()
@@ -338,9 +380,11 @@ public class Node {
                     .build();
         }
 
-        if (request.getTerm() > currentTerm.intValue()) {
+        if (state != State.FOLLOWER) {
             demote(State.FOLLOWER, request.getTerm());
         }
+
+        startElectionTimeout();
 
         if (prevLogIndex >= 0) {
             if (!logManager.hasEntry(prevLogIndex)) {
@@ -366,24 +410,28 @@ public class Node {
 
         // handling conflicting writes
         int logInsertIndex = prevLogIndex + 1;
-        for (int i = 0; i < request.getEntriesCount(); i++) {
-            int entryIndex = logInsertIndex + i;
-            LogEntry newEntry = request.getEntries(i);
+        int logEntriesIndex = 0;
+        for (; logEntriesIndex < request.getEntriesCount(); logEntriesIndex++) {
+            int entryIndex = logInsertIndex + logEntriesIndex;
+            LogEntry newEntry = request.getEntries(logEntriesIndex);
 
             if (logManager.hasEntry(entryIndex)) {
                 if (logManager.getTermAt(entryIndex) != newEntry.getTerm()) {
                     // Remove conflicting entries and all that follow
                     logManager.truncateFrom(entryIndex);
-                    logManager.appendEntries(Arrays.asList(newEntry));
+                    break;
                 }
             } else {
-                logManager.appendEntries(Arrays.asList(newEntry));
+                break;
             }
         }
 
+        if (logEntriesIndex < request.getEntriesCount()) {
+            logManager.appendEntries(request.getEntriesList().subList(logEntriesIndex, request.getEntriesCount()));
+        }
+
         if (request.getLeaderCommit() > commitIndex.intValue()) {
-            int lastNewEntryIndex = logManager.getLastIndex();
-            int newCommitIndex = Math.min(request.getLeaderCommit(), lastNewEntryIndex);
+            int newCommitIndex = Math.min(request.getLeaderCommit(), logManager.getLastIndex());
             store.persistCommitIndex(newCommitIndex);
             commitIndex.set(newCommitIndex);
             applyCommittedEntries();
@@ -402,6 +450,7 @@ public class Node {
 
     synchronized private void updateCommitIndex() {
         // Find the highest index replicated on a majority of servers
+        // Updating atomically
         for (int index = logManager.getLastIndex(); index > commitIndex.intValue(); index--) {
             if (logManager.getTermAt(index) == currentTerm.intValue()) {
                 int replicationCount = 1; // Count self
@@ -411,39 +460,12 @@ public class Node {
                     }
                 }
 
-                if (replicationCount > (clusterNodes.size() + 1) / 2) {
+                if (replicationCount >= clusterNodes.size()/2 + 1) {
                     store.persistCommitIndex(index);
                     commitIndex.set(index);
                     applyCommittedEntries();
                     break;
                 }
-            }
-        }
-    }
-
-    // Managed by candidates
-    synchronized public void handleVoteResponse(VoteResponse response) {
-        logger.debug("Node {} received vote response from {}, granted: {}, term: {}",
-                id, response.getVoterId(), response.getHasVoted(), response.getTerm());
-
-        if (state != State.CANDIDATE || response.getTerm() < currentTerm.intValue()) {
-            return;
-        }
-
-        if (response.getTerm() > currentTerm.intValue()) {
-            logger.info("Node {} stepping down: received higher term {} from {}",
-                    id, response.getTerm(), response.getVoterId());
-            demote(State.FOLLOWER, response.getTerm());
-            startElectionTimeout(0);
-            return;
-        }
-
-        if (response.getHasVoted()) {
-            votersInFavour.add(response.getVoterId());
-            logger.debug("Node {} received vote from {}, total votes: {}", id, response.getVoterId(), votersInFavour.size());
-            logger.trace("Current voters: {}", votersInFavour);
-            if (hasMajorityVotes()) {
-                promoteLeader();
             }
         }
     }
@@ -455,6 +477,7 @@ public class Node {
 
     // Managed by leader.
     synchronized public void handleAppendEntryResponse(AppendEntryResponse response) {
+        // This will happen when the node was leader when it sent the heartbeat, but it's no longer a leader now.
         if (state != State.LEADER) {
             return;
         }
@@ -466,8 +489,6 @@ public class Node {
 
         if (response.getTerm() > currentTerm.intValue()) {
             demote(State.FOLLOWER, response.getTerm());
-            store.persistTerm(response.getTerm());
-            startElectionTimeout(0);
             return;
         }
 
@@ -482,16 +503,19 @@ public class Node {
     }
 
     synchronized private void applyCommittedEntries() {
-        while (lastApplied.intValue() < commitIndex.intValue()) {
-            lastApplied.addAndGet(1);
-            if (logManager.hasEntry(lastApplied.intValue())) {
-                LogEntry entry = logManager.getEntry(lastApplied.intValue());
-                logger.debug("Applied entry ({}): {}", id, entry);
-                store.persistLogEntry(entry);
+        int savedCommitedIndex = commitIndex.intValue();
+        int savedLastApplied = lastApplied.intValue();
 
-                String command = entry.getCommand().toStringUtf8();
-                kvStore.applyCommand(command);
-            }
+        List<LogEntry> entries = new ArrayList<>();
+        if (savedLastApplied < savedCommitedIndex) {
+            entries.addAll(logManager.getEntriesFrom(savedLastApplied + 1, savedCommitedIndex + 1));
+        }
+
+        for (LogEntry entry: entries) {
+            logger.debug("Applied entry ({}): {}", id, entry);
+            lastApplied.addAndGet(1);
+            String command = entry.getCommand().toStringUtf8();
+            kvStore.applyCommand(command);
         }
     }
 

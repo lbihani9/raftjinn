@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.*;
 import java.util.*;
 
+import com.google.protobuf.ByteString;
 import org.jinn.configs.StoreConfig;
 import org.jinn.persistence.JinnPersistentState;
 import org.jinn.persistence.schema.jsonl.*;
@@ -91,13 +92,13 @@ public class JsonlStore implements JinnStore {
     public JinnPersistentState buildState() {
         int currentTerm = 0, commitIndex = 0;
         String votedFor = null;
-        TreeMap<Integer, LogEntry> entries = new TreeMap<>();
+        List<LogEntry> entries = new ArrayList<>();
 
         File walDir = storeConfig.getWalDirFile();
         File[] walFiles = walDir.listFiles((dir, name) -> name.matches("wal-\\d+\\.jsonl"));
         if (walFiles == null || walFiles.length == 0) {
             logger.info("No WAL files found in {}", walDir.getAbsolutePath());
-            return new JinnPersistentState(currentTerm, commitIndex, votedFor, new LinkedList<>(entries.values()));
+            return new JinnPersistentState(currentTerm, commitIndex, votedFor, entries);
         }
 
         Arrays.sort(walFiles, Comparator.comparingInt(
@@ -129,10 +130,13 @@ public class JsonlStore implements JinnStore {
                                 break;
                             case "LOG_ENTRY":
                                 NewLogData newLogData = mapper.treeToValue(dataNode, NewLogData.class);
-                                entries.put(
-                                    newLogData.getIndex(),
+                                int idx = newLogData.getIndex();
+                                if (idx < entries.size()) {
+                                    entries.subList(idx, entries.size()).clear();
+                                }
+                                entries.add(
                                     LogEntry.newBuilder()
-                                        .setCommand(newLogData.getCommand())
+                                        .setCommand(ByteString.copyFromUtf8(newLogData.getCommand()))
                                         .setIndex(newLogData.getIndex())
                                         .setTerm(newLogData.getTerm())
                                         .build()
@@ -140,15 +144,11 @@ public class JsonlStore implements JinnStore {
                                 break;
                             case "DELETE_LOG_ENTRY":
                                 DeleteLogData deleteLogData = mapper.treeToValue(dataNode, DeleteLogData.class);
-                                entries.tailMap(deleteLogData.getFromIndex()).clear();
+                                entries.subList(deleteLogData.getFromIndex(), entries.size()).clear();
                                 break;
-                            case "COMMIT":
+                            case "COMMIT_INDEX":
                                 CommitIndexData commitIndexData = mapper.treeToValue(dataNode, CommitIndexData.class);
                                 commitIndex = commitIndexData.getCommitIndex();
-
-                                // We're making sure that only the logs from commitIndex onwards are in memory.
-                                // This avoids unnecessary memory usage.
-                                entries.headMap(commitIndex).clear();
                                 break;
                             default:
                                 logger.warn("Unknown WAL type: {}", type);
@@ -164,7 +164,7 @@ public class JsonlStore implements JinnStore {
             }
         }
 
-        return new JinnPersistentState(currentTerm, commitIndex, votedFor, new LinkedList<>(entries.values()));
+        return new JinnPersistentState(currentTerm, commitIndex, votedFor, entries);
     }
 
     @Override

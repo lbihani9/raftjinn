@@ -10,7 +10,7 @@ RaftJinn is a durable and consistent implementation of the Raft consensus algori
 - 🧪 **Manually tested** with controlled multi-node setups
 - 💻 **Basic interactive terminal** for `GET` / `SET` over Raft via gRPC
 
-> ⚠️ No formal test suite yet — manual testing only. Automated tests coming soon.
+> ⚠️ No formal test suite yet — manual testing only.
 
 
 ## 🗳️ Raft Internal RPCs (Node ↔ Node)
@@ -84,14 +84,9 @@ At this stage, RaftJinn has been manually tested using locally spawned nodes (3�
 - [ ] Optimize `RaftLogManager` for log deletion/cleanup
 - [ ] Improve read/write performance of disk I/O (WAL & recovery)
 
-### 📦 Storage Layer Cleanup
-- [ ] Separate log entries from other persisted node state
-- [ ] Fine-tune layout and access patterns of the JSONL WAL
-
 ### 💬 Client + Terminal
 - [x] Minimalistic interactive CLI (`CONNECT`, `SET`, `GET`, `PING`)
 - [x] Automatic reconnect + retry on `leaderHint`
-- [ ] Improve client logic to build and replicate write requests
 - [ ] Better error handling + retry strategy in terminal client
 
 ### 🧪 Testing & Reliability
@@ -104,10 +99,10 @@ At this stage, RaftJinn has been manually tested using locally spawned nodes (3�
 
 Start a node with config:
 ```bash
-mvn exec:java -Dexec.mainClass='org.jinn.RaftNodeRunner' -Dexec.args='src/main/resources/configs/node1.yml'
+mvn compile exec:java -Dexec.mainClass='org.jinn.RaftNodeRunner' -Dexec.args='src/main/resources/configs/node1.yml'
 ```
 
 Start a client with config:
 ```bash
-mvn exec:java -Dexec.mainClass="org.jinn.client.RaftClient"
+mvn compile exec:java -Dexec.mainClass="org.jinn.client.RaftClient"
 ```
